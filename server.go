@@ -1,22 +1,37 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
-type HTTPRequest struct {
+type CustomHTTPRequest struct {
 	Method  string
 	Path    string
 	Version string
 	Headers map[string]string
-	Body    string
+	Body    []byte
 }
 
+type ServerStats struct {
+	mu              sync.Mutex
+	activeConns     int
+	totalConns      int
+	requestsHandled int
+	bytesReceived   int64
+	bytesSent       int64
+}
+
+var stats = &ServerStats{}
+
 func main() {
-	// Creates a listener on port 8081
 	listener, err := net.Listen("tcp", ":8081")
 
 	if err != nil {
@@ -24,13 +39,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ensures the listener is closed when the function exits
 	defer listener.Close()
 
 	fmt.Println("Server listening on :8081")
 
+	go reportStats()
+
 	for {
-		// this is a blocking call, it will await until a new connection happens
 		conn, err := listener.Accept()
 
 		if err != nil {
@@ -38,97 +53,203 @@ func main() {
 			continue
 		}
 
-		handleConnection(conn)
+		go handleConnection(conn)
 	}
 }
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	buffer := make([]byte, 4096)
-	n, err := conn.Read(buffer)
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+
+	stats.mu.Lock()
+	stats.activeConns++
+	stats.totalConns++
+	connId := stats.totalConns
+	stats.mu.Unlock()
+
+	defer func() {
+		stats.mu.Lock()
+		stats.activeConns--
+		stats.mu.Unlock()
+	}()
+
+	fmt.Printf("[Conn %d] New connection from %s\n", connId, conn.RemoteAddr())
+	reader := bufio.NewReader(conn)
+
+	request, bytesRead, err := parseRequestStreaming(reader)
+
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[Conn %d] Error parsing request: %v\n", connId, err)
+		sendResponse(conn, 400, "Bad Request", []byte("Invalid HTTP request"))
 		return
 	}
 
-	request, err := parseRequest(string(buffer[:n]))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error parsing request: %v\n", err)
-		sendResponse(conn, 400, "Bad Request", "Invalid HTTP request")
-		return
-	}
+	stats.mu.Lock()
+	stats.bytesReceived += int64(bytesRead)
+	stats.mu.Unlock()
 
-	fmt.Printf("Method: %s\n", request.Method)
-	fmt.Printf("Path: %s\n", request.Path)
-	fmt.Printf("Version: %s\n", request.Version)
-	fmt.Printf("Headers: %v\n", request.Headers)
-	fmt.Println("---")
+	fmt.Printf("[Conn %d] %s %s (body: %d bytes)\n", connId, request.Method, request.Path, len(request.Body))
 
-	handleRequest(conn, request)
+	bytesSent := handleRequest(conn, request, connId)
+
+	stats.mu.Lock()
+	stats.requestsHandled++
+	stats.bytesSent += int64(bytesSent)
+	stats.mu.Unlock()
+
+	fmt.Printf("[Conn %d] Request completed\n", connId)
 }
 
-func parseRequest(rawRequest string) (*HTTPRequest, error) {
-	// Split by \r\n to get lines
-	lines := strings.Split(rawRequest, "\r\n")
-	if len(lines) < 1 {
-		return nil, fmt.Errorf("empty request")
+func parseRequestStreaming(reader *bufio.Reader) (*CustomHTTPRequest, int, error) {
+	totalBytes := 0
+
+	requestLine, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to read request line: %v", err)
 	}
 
-	// Parse the request line (first line)
-	// Format: METHOD PATH VERSION
-	requestLine := strings.Split(lines[0], " ")
-	if len(requestLine) != 3 {
-		return nil, fmt.Errorf("invalid request line")
+	totalBytes += len(requestLine)
+
+	requestLine = strings.TrimSpace(requestLine)
+
+	parts := strings.Split(requestLine, " ")
+	if len(parts) != 3 {
+		return nil, totalBytes, fmt.Errorf("Invalid request line: %s", requestLine)
 	}
 
-	request := &HTTPRequest{
-		Method:  requestLine[0],
-		Path:    requestLine[1],
-		Version: requestLine[2],
+	request := &CustomHTTPRequest{
+		Method:  parts[0],
+		Path:    parts[1],
+		Version: parts[2],
 		Headers: make(map[string]string),
 	}
 
-	// Parse headers
-	i := 1
-	for i < len(lines) && lines[i] != "" {
-		// Header format: "Key: Value"
-		parts := strings.SplitN(lines[i], ": ", 2)
-		if len(parts) == 2 {
-			request.Headers[parts[0]] = parts[1]
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, totalBytes, fmt.Errorf("failed to read header: %v", err)
 		}
-		i++
+		totalBytes += len(line)
+
+		line = strings.TrimSpace(line)
+
+		if line == "" {
+			break
+		}
+
+		colonIdx := strings.Index(line, ": ")
+		if colonIdx == -1 {
+			colonIdx = strings.Index(line, ":")
+
+			if colonIdx == -1 {
+				continue
+			}
+			request.Headers[line[:colonIdx]] = strings.TrimSpace(line[colonIdx+1:])
+		} else {
+			request.Headers[line[:colonIdx]] = line[colonIdx+2:]
+		}
 	}
 
-	// Body starts after the blank line
-	if i < len(lines)-1 {
-		request.Body = strings.Join(lines[i+1:], "\r\n")
+	if contentLengthStr, exists := request.Headers["Content-Length"]; exists {
+		contentLength, err := strconv.Atoi(contentLengthStr)
+		if err != nil {
+			return nil, totalBytes, fmt.Errorf("invalid content length: %v", err)
+		}
+
+		if contentLength > 0 {
+			request.Body = make([]byte, contentLength)
+			n, err := io.ReadFull(reader, request.Body)
+
+			totalBytes += n
+
+			if err != nil {
+				return nil, totalBytes, fmt.Errorf("failed to read body: %v", err)
+			}
+		}
 	}
 
-	return request, nil
+	return request, totalBytes, nil
 }
 
-func handleRequest(conn net.Conn, request *HTTPRequest) {
-	// Simple routing based on path
+func handleRequest(conn net.Conn, request *CustomHTTPRequest, connId int) int {
+	var responseBody []byte
+	var statusCode int
+	var statusText string
+
 	switch request.Path {
 	case "/":
-		sendResponse(conn, 200, "OK", "Welcome to the home page!")
-	case "/hello":
-		sendResponse(conn, 200, "OK", "Hello, World!")
-	case "/about":
-		sendResponse(conn, 200, "OK", "This is a custom HTTP server built from scratch!")
+		statusCode = 200
+		statusText = "OK"
+		responseBody = []byte("Welcome to the streaming HTTP server!")
+
+	case "/echo":
+		statusCode = 200
+		statusText = "OK"
+		if len(request.Body) > 0 {
+			responseBody = []byte(fmt.Sprintf("Received %d bytes:\n%s", len(request.Body), string(request.Body)))
+		} else {
+			responseBody = []byte("No body received")
+		}
+	case "/large":
+		statusCode = 200
+		statusText = "OK"
+		size := 100000
+		responseBody = make([]byte, size)
+		for i := range responseBody {
+			responseBody[i] = byte('A' + (i % 26))
+		}
+	case "/stats":
+		stats.mu.Lock()
+		body := fmt.Sprintf("Active connection: %d\nTotal Connections: %d\nRequests handled: %d\nBytes Received: %d\nBytes Sent: %d", stats.activeConns, stats.totalConns, stats.requestsHandled, stats.bytesReceived, stats.bytesSent)
+		stats.mu.Unlock()
+		statusCode = 200
+		statusText = "OK"
+		responseBody = []byte(body)
+
+	case "/slow":
+		fmt.Printf("[Conn %d] Simulating slow request (5s)...\n", connId)
+		time.Sleep(5 * time.Second)
+		statusCode = 200
+		statusText = "OK"
+		responseBody = []byte("This response took 5 seconds")
 	default:
-		sendResponse(conn, 404, "Not Found", "The requested path was not found")
+		statusCode = 400
+		statusText = "Not Found"
+		responseBody = []byte("The requested path was not found")
 	}
+
+	return sendResponse(conn, statusCode, statusText, responseBody)
 }
 
-func sendResponse(conn net.Conn, statusCode int, statusText string, body string) {
-	// Build the response
-	response := fmt.Sprintf("HTTP/1.1 %d %s\r\n", statusCode, statusText)
-	response += "Content-Type: text/plain\r\n"
-	response += fmt.Sprintf("Content-Length: %d\r\n", len(body))
-	response += "\r\n"
-	response += body
+func sendResponse(conn net.Conn, statusCode int, statusText string, body []byte) int {
+	header := fmt.Sprintf("HTTP/1.1 %d %s\r\n", statusCode, statusText)
+	header += "Content-Type: text/plain\r\n"
+	header += fmt.Sprintf("Content-Length: %d\r\n", len(body))
+	header += "\r\n"
 
-	conn.Write([]byte(response))
+	headerBytes := []byte(header)
+	conn.Write(headerBytes)
+
+	conn.Write(body)
+
+	return len(headerBytes) + len(body)
+}
+
+func reportStats() {
+	ticker := time.NewTicker(10 * time.Second)
+
+	defer ticker.Stop()
+
+	for range ticker.C {
+		stats.mu.Lock()
+		fmt.Printf("\n=== Server Stats === \n")
+		fmt.Printf("Active connections: %d\n", stats.activeConns)
+		fmt.Printf("Total connections: %d\n", stats.totalConns)
+		fmt.Printf("Requests handled: %d\n", stats.requestsHandled)
+		fmt.Printf("Bytes received: %d (%.2f KB)\n", stats.bytesReceived, float64(stats.bytesReceived)/1024.0)
+		fmt.Printf("Bytes sent: %d (%.2f KB)\n", stats.bytesSent, float64(stats.bytesSent)/1024.0)
+		fmt.Printf("=============\n\n")
+		stats.mu.Unlock()
+	}
 }
