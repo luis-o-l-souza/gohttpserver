@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -76,12 +77,14 @@ func handleConnection(conn net.Conn) {
 
 	fmt.Printf("[Conn %d] New connection from %s\n", connId, conn.RemoteAddr())
 	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
 
 	request, bytesRead, err := parseRequestStreaming(reader)
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[Conn %d] Error parsing request: %v\n", connId, err)
-		sendResponse(conn, 400, "Bad Request", []byte("Invalid HTTP request"))
+		sendResponse(writer, 400, "Bad Request", []byte("Invalid HTTP request"), false)
+		writer.Flush()
 		return
 	}
 
@@ -91,7 +94,8 @@ func handleConnection(conn net.Conn) {
 
 	fmt.Printf("[Conn %d] %s %s (body: %d bytes)\n", connId, request.Method, request.Path, len(request.Body))
 
-	bytesSent := handleRequest(conn, request, connId)
+	bytesSent := handleRequest(writer, request, connId)
+	writer.Flush()
 
 	stats.mu.Lock()
 	stats.requestsHandled++
@@ -151,7 +155,18 @@ func parseRequestStreaming(reader *bufio.Reader) (*CustomHTTPRequest, int, error
 		}
 	}
 
-	if contentLengthStr, exists := request.Headers["Content-Length"]; exists {
+	transferEncoding := strings.ToLower(request.Headers["Transfer-Encoding"])
+
+	if transferEncoding == "chunked" {
+		body, bytesRead, err := readChunkedBody(reader)
+		totalBytes += bytesRead
+		if err != nil {
+			return nil, totalBytes, fmt.Errorf("failed to read chunked body: %v", err)
+		}
+
+		request.Body = body
+		fmt.Printf("Read chunked body: %d bytes total\n", len(body))
+	} else if contentLengthStr, exists := request.Headers["Content-Length"]; exists {
 		contentLength, err := strconv.Atoi(contentLengthStr)
 		if err != nil {
 			return nil, totalBytes, fmt.Errorf("invalid content length: %v", err)
@@ -172,17 +187,88 @@ func parseRequestStreaming(reader *bufio.Reader) (*CustomHTTPRequest, int, error
 	return request, totalBytes, nil
 }
 
-func handleRequest(conn net.Conn, request *CustomHTTPRequest, connId int) int {
+func readChunkedBody(reader *bufio.Reader) ([]byte, int, error) {
+	var body bytes.Buffer
+
+	totalBytesRead := 0
+
+	for {
+		sizeLine, err := reader.ReadString('\n')
+		fmt.Printf("sizeLine size: %v", sizeLine)
+		if err != nil {
+			return nil, totalBytesRead, fmt.Errorf("error reading chunk size: %v", err)
+		}
+
+		totalBytesRead += len(sizeLine)
+
+		sizeLine = strings.TrimSpace(sizeLine)
+
+		if idx := strings.Index(sizeLine, ";"); idx != -1 {
+			sizeLine = sizeLine[:idx]
+		}
+
+
+		chunkSize, err := strconv.ParseInt(sizeLine, 16, 64)
+		fmt.Printf("chunkSize size: %v", chunkSize)
+
+		if err != nil {
+			return nil, totalBytesRead, fmt.Errorf("invalid chunk size '%s': %v", sizeLine, err)
+		}
+
+		fmt.Printf(" Chunk size 0x%s = %d bytes\n", sizeLine, chunkSize)
+
+
+		if chunkSize == 0 {
+			finalLine, err := reader.ReadString('\n')
+			if err != nil {
+				return nil, totalBytesRead, fmt.Errorf("error reading final CRLF: %v", err)
+			}
+
+			totalBytesRead += len(finalLine)
+			break
+		}
+
+		chunkData := make([]byte, chunkSize)
+		n, err := io.ReadFull(reader, chunkData)
+		totalBytesRead += n
+
+		if err != nil {
+			return nil, totalBytesRead, fmt.Errorf("error reading chunk data: %v", err)
+		}
+
+		body.Write(chunkData)
+
+		trailingCRLF := make([]byte, 2)
+		n, err = io.ReadFull(reader, trailingCRLF)
+		totalBytesRead += n
+
+		if err != nil {
+			return nil, totalBytesRead, fmt.Errorf("error reading chunk trailing CRLF: %v", err)
+		}
+
+		if string(trailingCRLF) != "\r\n" {
+			return nil, totalBytesRead, fmt.Errorf("expected CRLF after chunk, got %v", trailingCRLF)
+		}
+	}
+
+	return body.Bytes(), totalBytesRead, nil
+}
+
+func handleRequest(writer *bufio.Writer, request *CustomHTTPRequest, connId int) int {
 	var responseBody []byte
 	var statusCode int
 	var statusText string
-
+	chunked := false
 	switch request.Path {
 	case "/":
 		statusCode = 200
 		statusText = "OK"
 		responseBody = []byte("Welcome to the streaming HTTP server!")
-
+	case "/stream":
+			statusCode = 200
+			statusText = "OK"
+			chunked = true
+			return sendChunkedResponse(writer, statusCode, statusText, connId)
 	case "/echo":
 		statusCode = 200
 		statusText = "OK"
@@ -219,21 +305,77 @@ func handleRequest(conn net.Conn, request *CustomHTTPRequest, connId int) int {
 		responseBody = []byte("The requested path was not found")
 	}
 
-	return sendResponse(conn, statusCode, statusText, responseBody)
+	return sendResponse(writer, statusCode, statusText, responseBody, chunked)
 }
 
-func sendResponse(conn net.Conn, statusCode int, statusText string, body []byte) int {
+func sendResponse(writer *bufio.Writer, statusCode int, statusText string, body []byte, chunked bool) int {
 	header := fmt.Sprintf("HTTP/1.1 %d %s\r\n", statusCode, statusText)
 	header += "Content-Type: text/plain\r\n"
-	header += fmt.Sprintf("Content-Length: %d\r\n", len(body))
+
+	if !chunked {
+		header += fmt.Sprintf("Content-Length: %d\r\n", len(body))
+	} else {
+		header += "Transfer-Encoding: chunked\r\n"
+	}
+
+	header += "Connection: close\r\n"
 	header += "\r\n"
 
 	headerBytes := []byte(header)
-	conn.Write(headerBytes)
+	writer.Write(headerBytes)
 
-	conn.Write(body)
+	totalSent := len(headerBytes)
 
-	return len(headerBytes) + len(body)
+	if !chunked {
+		writer.Write(body)
+		totalSent += len(body)
+	}
+
+	return totalSent
+}
+
+func sendChunkedResponse(writer *bufio.Writer, statusCode int, statusText string, connId int) int {
+	header := fmt.Sprintf("HTTP/1.1 %d %s\r\n", statusCode, statusText)
+	header += "Content-Type: text/plain\r\n"
+	header += "Transfer-Encoding: chunked\r\n"
+	header += "Connection: close\r\n"
+	header += "\r\n"
+
+	writer.Write([]byte(header))
+	totalSent := len(header)
+
+	messages := []string{
+		"Chunk 1: starting stream...\n",
+		"Chunk 2: Processing data....\n",
+		"Chunk 3: Almost done...\n",
+		"Chunk 4: Complete!\n",
+	}
+
+	for i, msg := range messages {
+		fmt.Printf("[Conn %d] Sending chunk %d\n", connId, i+1)
+
+		chunkSize := fmt.Sprintf("%x\r\n", len(msg))
+		writer.Write([]byte(chunkSize))
+		totalSent += len(chunkSize)
+
+
+		writer.Write([]byte(msg))
+		totalSent += len(msg)
+
+		writer.Write([]byte("\r\n"))
+		totalSent += 2
+
+		writer.Flush()
+
+		time.Sleep(1 * time.Second)
+	}
+
+	writer.Write([]byte("0\r\n\r\n"))
+	totalSent += 5
+
+	fmt.Printf("[Conn %d] Chunked response complete\n", connId)
+
+	return totalSent
 }
 
 func reportStats() {
