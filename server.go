@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -19,6 +20,15 @@ type CustomHTTPRequest struct {
 	Version string
 	Headers map[string]string
 	Body    []byte
+	SequenceNum int
+}
+
+type CustomHTTPResponse struct {
+	StatusCode int
+	StatusText string
+	Headers map[string]string
+	Body []byte
+	SequenceNum int
 }
 
 type ServerStats struct {
@@ -30,6 +40,7 @@ type ServerStats struct {
 	bytesSent       int64
 	keepAliveConns int
 	keepAliveRequests int64
+	pipelinedRequests int64
 }
 
 var stats = &ServerStats{}
@@ -38,6 +49,7 @@ const (
 	keepAliveTimeout = 5 * time.Second
 	maxKeepAliveRequests = 100
 	requestTimeout = 30 * time.Second
+	maxPipelineDepth = 10
 )
 
 func main() {
@@ -53,6 +65,7 @@ func main() {
 	fmt.Println("Server listening on :8081")
 	fmt.Printf("Keep-alive timeout: %v\n", keepAliveTimeout)
 	fmt.Printf("Max requests per connection: %d\n", maxKeepAliveRequests)
+	fmt.Printf("HTTP Pipelining enabled (max depth %d)\n", maxPipelineDepth)
 
 	go reportStats()
 
@@ -71,8 +84,6 @@ func main() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-
 	stats.mu.Lock()
 	stats.activeConns++
 	stats.totalConns++
@@ -86,10 +97,41 @@ func handleConnection(conn net.Conn) {
 	}()
 
 	fmt.Printf("[Conn %d] New connection from %s\n", connId, conn.RemoteAddr())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	requestChan := make(chan *CustomHTTPRequest, maxPipelineDepth)
+	responseChan := make(chan *CustomHTTPResponse, maxPipelineDepth)
+
+	errChan := make(chan error, 3)
+
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	keepAlive := true
+	go readRequests(ctx, reader, requestChan, errChan, connId, conn)
+
+	go processRequests(ctx, requestChan, responseChan, errChan, connId)
+
+	go writeResponses(ctx, writer, responseChan, errChan, connId)
+
+	err := <-errChan
+
+	cancel()
+
+	close(requestChan)
+	close(responseChan)
+
+	if err != nil {
+		if err != io.EOF {
+			fmt.Printf("[Conn %d] Connection error: %v\n", connId, err)
+		} else {
+			fmt.Printf("[Conn %d] Client closed connection\n", connId)
+		}
+	}
+
+	fmt.Printf("[Conn %d] Connection closed\n", connId)
+	/** keepAlive := true
 	requestCount := 0
 
 
@@ -164,6 +206,128 @@ func handleConnection(conn net.Conn) {
 	}
 
 	fmt.Printf("[Conn %d] Connection closed after %d requests\n", connId, requestCount)
+	**/
+}
+
+func readRequests(ctx context.Context, reader *bufio.Reader, requestChan chan<- *CustomHTTPRequest, errChan chan<- error, connId int, conn net.Conn) {
+	sequenceNum := 0
+	requestCount := 0
+
+	for {
+		select {
+			case <- ctx.Done():
+				return
+			default:
+		}
+
+		if requestCount > 0 {
+			conn.SetReadDeadline(time.Now().Add(keepAliveTimeout))
+		} else {
+			conn.SetReadDeadline(time.Now().Add(requestTimeout))
+		}
+
+		request, bytesRead, err := parseRequestStreaming(reader)
+
+		if err != nil {
+
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if requestCount > 0 {
+					fmt.Printf("[Conn %d] Keep-alive timeout after %d requests\n", connId, requestCount)
+					errChan <- io.EOF
+					return
+				}
+			}
+			errChan <- err
+			return
+		}
+
+		sequenceNum++
+		requestCount++
+
+		request.SequenceNum = sequenceNum
+
+		stats.mu.Lock()
+		stats.bytesReceived += int64(bytesRead)
+
+		if requestCount > 1 {
+			stats.pipelinedRequests++
+		}
+
+		stats.mu.Unlock()
+
+		fmt.Printf("[Conn %d-%d] Received: %s %s\n", connId, sequenceNum, request.Method, request.Path)
+
+		select {
+			case requestChan <- request:
+
+			case <- ctx.Done():
+			return
+		}
+
+		if strings.ToLower(request.Headers["Connection"]) == "close" {
+			fmt.Printf("[Conn %d] Client requested close\n", connId)
+
+			time.Sleep(100 * time.Millisecond)
+			errChan <- io.EOF
+			return
+		}
+
+		if requestCount >= maxKeepAliveRequests {
+			fmt.Printf("[Conn %d] Max requests reached\n", connId)
+			errChan <- io.EOF
+			return
+		}
+	}
+}
+func processRequests(ctx context.Context, requestChan <-chan *CustomHTTPRequest, responseChan chan<- *CustomHTTPResponse, errChan chan <- error, connId int) {
+	for {
+		select {
+			case <-ctx.Done():
+				return
+			case request, ok := <-requestChan:
+			if !ok {
+				return
+			}
+
+			fmt.Printf("[Conn %d-%d] Processing: %s %s\n", connId, request.SequenceNum, request.Method, request.Path)
+
+			response := handleRequestPipeline(request, connId)
+
+			fmt.Printf("[Conn %d-%d] Completed: %s %s (%d)\n", connId, request.SequenceNum, request.Method, request.Path, response.StatusCode)
+
+			select {
+				case responseChan <- response:
+
+				case <- ctx.Done():
+					return
+			}
+		}
+	}
+
+}
+
+func writeResponses(ctx context.Context, writer *bufio.Writer, responseChan <- chan *CustomHTTPResponse, errChan chan <-error, connId int) {
+	for {
+		select {
+			case <- ctx.Done():
+				return
+
+			case response, ok := <-responseChan:
+				if !ok {
+					return
+				}
+
+				fmt.Printf("[Conn %d-%d] Sending response\n", connId, response.SequenceNum)
+
+				bytesSent := writeResponse(writer, response)
+				writer.Flush()
+
+				stats.mu.Lock()
+				stats.requestsHandled++
+				stats.bytesSent += int64(bytesSent)
+				stats.mu.Unlock()
+		}
+	}
 }
 
 func parseRequestStreaming(reader *bufio.Reader) (*CustomHTTPRequest, int, error) {
@@ -315,6 +479,101 @@ func readChunkedBody(reader *bufio.Reader) ([]byte, int, error) {
 	return body.Bytes(), totalBytesRead, nil
 }
 
+func handleRequestPipeline(request *CustomHTTPRequest, connId int) *CustomHTTPResponse {
+	var body []byte
+	var statusCode int
+	var statusText string
+
+	switch request.Path {
+    case "/":
+        statusCode = 200
+        statusText = "OK"
+        body = []byte("Welcome to the pipelined HTTP server!")
+
+    case "/fast":
+        statusCode = 200
+        statusText = "OK"
+        body = []byte("Fast response!")
+
+    case "/slow":
+        // Simulate slow processing
+        time.Sleep(3 * time.Second)
+        statusCode = 200
+        statusText = "OK"
+        body = []byte("Slow response (took 3 seconds)")
+
+    case "/echo":
+        statusCode = 200
+        statusText = "OK"
+        if len(request.Body) > 0 {
+            body = []byte(fmt.Sprintf("Received %d bytes:\n%s", len(request.Body), string(request.Body)))
+        } else {
+            body = []byte("No body received")
+        }
+
+    case "/stats":
+        stats.mu.Lock()
+        bodyStr := fmt.Sprintf("Active connections: %d\n"+
+            "Total connections: %d\n"+
+            "Requests handled: %d\n"+
+            "Keep-alive connections: %d\n"+
+            "Keep-alive requests: %d\n"+
+            "Pipelined requests: %d\n"+
+            "Bytes received: %d (%.2f KB)\n"+
+            "Bytes sent: %d (%.2f KB)\n",
+            stats.activeConns, stats.totalConns, stats.requestsHandled,
+            stats.keepAliveConns, stats.keepAliveRequests, stats.pipelinedRequests,
+            stats.bytesReceived, float64(stats.bytesReceived)/1024.0,
+            stats.bytesSent, float64(stats.bytesSent)/1024.0)
+        stats.mu.Unlock()
+        statusCode = 200
+        statusText = "OK"
+        body = []byte(bodyStr)
+
+    default:
+        statusCode = 404
+        statusText = "Not Found"
+        body = []byte("The requested path was not found")
+    }
+
+    response := &CustomHTTPResponse{
+    StatusCode: statusCode,
+    StatusText: statusText,
+    Headers: make(map[string]string),
+    Body: body,
+    SequenceNum: request.SequenceNum,
+    }
+
+    response.Headers["Content-Type"] = "text/plain"
+    response.Headers["Content-Length"] = strconv.Itoa(len(body))
+    response.Headers["Connection"] = "keep-alive"
+
+    return response
+}
+
+func writeResponse(writer *bufio.Writer, response *CustomHTTPResponse) int {
+	statusLine := fmt.Sprintf("HTTP/1.1 %d %s\r\n", response.StatusCode, response.StatusText)
+
+	writer.WriteString(statusLine)
+
+	totalSent := len(statusLine)
+
+	for key, value := range response.Headers {
+		header := fmt.Sprintf("%s: %s\r\n", key, value)
+		writer.WriteString(header)
+		totalSent += len(header)
+	}
+
+
+	writer.WriteString("\r\n")
+	totalSent += 2
+
+	writer.Write(response.Body)
+	totalSent += len(response.Body)
+
+	return totalSent
+}
+
 func handleRequest(writer *bufio.Writer, request *CustomHTTPRequest, connId int, requestNum int, keepAlive bool) int {
 	var responseBody []byte
 	var statusCode int
@@ -460,6 +719,7 @@ func reportStats() {
 		fmt.Printf("Requests handled: %d\n", stats.requestsHandled)
 		fmt.Printf("Keep-alive connections: %d\n", stats.keepAliveConns)
 		fmt.Printf("Keep-alive requests: %d\n", stats.keepAliveRequests)
+	  	fmt.Printf("Pipelined requests: %d\n", stats.pipelinedRequests)
 		fmt.Printf("Bytes received: %d (%.2f KB)\n", stats.bytesReceived, float64(stats.bytesReceived)/1024.0)
 		fmt.Printf("Bytes sent: %d (%.2f KB)\n", stats.bytesSent, float64(stats.bytesSent)/1024.0)
 
