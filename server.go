@@ -28,9 +28,17 @@ type ServerStats struct {
 	requestsHandled int
 	bytesReceived   int64
 	bytesSent       int64
+	keepAliveConns int
+	keepAliveRequests int64
 }
 
 var stats = &ServerStats{}
+
+const (
+	keepAliveTimeout = 5 * time.Second
+	maxKeepAliveRequests = 100
+	requestTimeout = 30 * time.Second
+)
 
 func main() {
 	listener, err := net.Listen("tcp", ":8081")
@@ -43,6 +51,8 @@ func main() {
 	defer listener.Close()
 
 	fmt.Println("Server listening on :8081")
+	fmt.Printf("Keep-alive timeout: %v\n", keepAliveTimeout)
+	fmt.Printf("Max requests per connection: %d\n", maxKeepAliveRequests)
 
 	go reportStats()
 
@@ -79,30 +89,81 @@ func handleConnection(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	request, bytesRead, err := parseRequestStreaming(reader)
+	keepAlive := true
+	requestCount := 0
 
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[Conn %d] Error parsing request: %v\n", connId, err)
-		sendResponse(writer, 400, "Bad Request", []byte("Invalid HTTP request"), false)
+
+	for keepAlive && requestCount < maxKeepAliveRequests {
+		requestCount++
+		if requestCount > 1 {
+			conn.SetReadDeadline(time.Now().Add(keepAliveTimeout))
+		} else {
+			conn.SetReadDeadline(time.Now().Add(requestTimeout))
+		}
+
+		request, bytesRead, err := parseRequestStreaming(reader)
+
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				if requestCount > 1 {
+					fmt.Printf("[Conn %d] Keep-alive timeout after %d requests\n", connId, requestCount - 1)
+				} else {
+					fmt.Printf("[Conn %d] timeout on first request\n", connId)
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "[Conn %d] Error parsing request: %v\n", connId, err)
+				if requestCount == 1 {
+					sendResponse(writer, 400, "Bad Request", []byte("Invalid HTTP request"), false)
+					writer.Flush()
+				}
+			}
+			break
+		}
+		stats.mu.Lock()
+		stats.bytesReceived += int64(bytesRead)
+		if requestCount > 1 {
+			stats.keepAliveRequests++
+		}
+		stats.mu.Unlock()
+
+		fmt.Printf("[Conn %d-%d] %s %s\n", connId, requestCount, request.Method, request.Path)
+
+		connectionHeader := strings.ToLower(request.Headers["Connection"])
+		clientWantsClose := connectionHeader == "close"
+
+		shouldKeepAlive := !clientWantsClose &&
+		requestCount < maxKeepAliveRequests &&
+		request.Version == "HTTP/1.1"
+
+		bytesSent := handleRequest(writer, request, connId, requestCount, shouldKeepAlive)
 		writer.Flush()
-		return
+
+		stats.mu.Lock()
+		stats.requestsHandled++
+		stats.bytesSent += int64(bytesSent)
+		stats.mu.Unlock()
+
+
+		keepAlive = shouldKeepAlive
+
+		if !keepAlive {
+			if clientWantsClose {
+				fmt.Printf("[Conn %d] Client requested connection close\n", connId)
+			} else if requestCount >= maxKeepAliveRequests {
+				fmt.Printf("[Conn %d] Max requests reached\n", connId)
+			}
+
+			break
+		}
+
+		if requestCount == 1 && keepAlive {
+			stats.mu.Lock()
+			stats.keepAliveConns++
+			stats.mu.Unlock()
+		}
 	}
 
-	stats.mu.Lock()
-	stats.bytesReceived += int64(bytesRead)
-	stats.mu.Unlock()
-
-	fmt.Printf("[Conn %d] %s %s (body: %d bytes)\n", connId, request.Method, request.Path, len(request.Body))
-
-	bytesSent := handleRequest(writer, request, connId)
-	writer.Flush()
-
-	stats.mu.Lock()
-	stats.requestsHandled++
-	stats.bytesSent += int64(bytesSent)
-	stats.mu.Unlock()
-
-	fmt.Printf("[Conn %d] Request completed\n", connId)
+	fmt.Printf("[Conn %d] Connection closed after %d requests\n", connId, requestCount)
 }
 
 func parseRequestStreaming(reader *bufio.Reader) (*CustomHTTPRequest, int, error) {
@@ -254,21 +315,23 @@ func readChunkedBody(reader *bufio.Reader) ([]byte, int, error) {
 	return body.Bytes(), totalBytesRead, nil
 }
 
-func handleRequest(writer *bufio.Writer, request *CustomHTTPRequest, connId int) int {
+func handleRequest(writer *bufio.Writer, request *CustomHTTPRequest, connId int, requestNum int, keepAlive bool) int {
 	var responseBody []byte
 	var statusCode int
 	var statusText string
-	chunked := false
 	switch request.Path {
 	case "/":
 		statusCode = 200
 		statusText = "OK"
-		responseBody = []byte("Welcome to the streaming HTTP server!")
+		responseBody = []byte(fmt.Sprintf("Welcome to the streaming HTTP server! Connection will %s after this request.\n", map[bool]string{true: "stay open", false: "close"}[keepAlive]))
 	case "/stream":
-			statusCode = 200
-			statusText = "OK"
-			chunked = true
-			return sendChunkedResponse(writer, statusCode, statusText, connId)
+		statusCode = 200
+		statusText = "OK"
+		return sendChunkedResponse(writer, statusCode, statusText, connId, keepAlive)
+	case "/counter":
+		statusCode = 200
+		statusText = "OK"
+		responseBody = []byte(fmt.Sprintf("This is request #%d on this connection\n", requestNum))
 	case "/echo":
 		statusCode = 200
 		statusText = "OK"
@@ -287,7 +350,13 @@ func handleRequest(writer *bufio.Writer, request *CustomHTTPRequest, connId int)
 		}
 	case "/stats":
 		stats.mu.Lock()
-		body := fmt.Sprintf("Active connection: %d\nTotal Connections: %d\nRequests handled: %d\nBytes Received: %d\nBytes Sent: %d", stats.activeConns, stats.totalConns, stats.requestsHandled, stats.bytesReceived, stats.bytesSent)
+		body := fmt.Sprintf("Active connection: %d\n" +
+			"Total Connections: %d\n" +
+			"Requests handled: %d\n" +
+			"Bytes Received: %d\n" +
+			"Bytes Sent: %d" +
+			"Keep-alive connections: %d\n" +
+			"Keep-alive requests: %d\n", stats.activeConns, stats.totalConns, stats.requestsHandled, stats.bytesReceived, stats.bytesSent, stats.keepAliveConns, stats.keepAliveRequests)
 		stats.mu.Unlock()
 		statusCode = 200
 		statusText = "OK"
@@ -305,40 +374,40 @@ func handleRequest(writer *bufio.Writer, request *CustomHTTPRequest, connId int)
 		responseBody = []byte("The requested path was not found")
 	}
 
-	return sendResponse(writer, statusCode, statusText, responseBody, chunked)
+	return sendResponse(writer, statusCode, statusText, responseBody, keepAlive)
 }
 
-func sendResponse(writer *bufio.Writer, statusCode int, statusText string, body []byte, chunked bool) int {
+func sendResponse(writer *bufio.Writer, statusCode int, statusText string, body []byte, keepAlive bool) int {
 	header := fmt.Sprintf("HTTP/1.1 %d %s\r\n", statusCode, statusText)
 	header += "Content-Type: text/plain\r\n"
+	header += fmt.Sprintf("Content-Length: %d\r\n", len(body))
 
-	if !chunked {
-		header += fmt.Sprintf("Content-Length: %d\r\n", len(body))
+	if keepAlive {
+		header += "Connection: keep-alive\r\n"
+		header += fmt.Sprintf("Keep-Alive: timeout=%d, max=%d\r\n", int(keepAliveTimeout.Seconds()), maxKeepAliveRequests)
 	} else {
-		header += "Transfer-Encoding: chunked\r\n"
+		header += "Connection: close\r\n"
 	}
-
-	header += "Connection: close\r\n"
 	header += "\r\n"
 
 	headerBytes := []byte(header)
 	writer.Write(headerBytes)
+	writer.Write(body)
 
-	totalSent := len(headerBytes)
-
-	if !chunked {
-		writer.Write(body)
-		totalSent += len(body)
-	}
-
-	return totalSent
+	return len(headerBytes) + len(body)
 }
 
-func sendChunkedResponse(writer *bufio.Writer, statusCode int, statusText string, connId int) int {
+func sendChunkedResponse(writer *bufio.Writer, statusCode int, statusText string, connId int, keepAlive bool) int {
 	header := fmt.Sprintf("HTTP/1.1 %d %s\r\n", statusCode, statusText)
 	header += "Content-Type: text/plain\r\n"
 	header += "Transfer-Encoding: chunked\r\n"
-	header += "Connection: close\r\n"
+
+	if keepAlive {
+		header += "Connection: keep-alive\r\n"
+	} else {
+		header += "Connection: close\r\n"
+	}
+
 	header += "\r\n"
 
 	writer.Write([]byte(header))
@@ -389,8 +458,17 @@ func reportStats() {
 		fmt.Printf("Active connections: %d\n", stats.activeConns)
 		fmt.Printf("Total connections: %d\n", stats.totalConns)
 		fmt.Printf("Requests handled: %d\n", stats.requestsHandled)
+		fmt.Printf("Keep-alive connections: %d\n", stats.keepAliveConns)
+		fmt.Printf("Keep-alive requests: %d\n", stats.keepAliveRequests)
 		fmt.Printf("Bytes received: %d (%.2f KB)\n", stats.bytesReceived, float64(stats.bytesReceived)/1024.0)
 		fmt.Printf("Bytes sent: %d (%.2f KB)\n", stats.bytesSent, float64(stats.bytesSent)/1024.0)
+
+		if stats.totalConns > 0 {
+			avgRequestsPerConn := float64(stats.requestsHandled) / float64(stats.totalConns)
+			fmt.Printf("Avg requests per connection: %.2f\n", avgRequestsPerConn)
+		}
+
+
 		fmt.Printf("=============\n\n")
 		stats.mu.Unlock()
 	}
